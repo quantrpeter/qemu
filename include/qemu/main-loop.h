@@ -157,6 +157,8 @@ typedef void WaitObjectFunc(void *opaque);
  * in the main loop's calls to WaitForMultipleObjects.  When the handle
  * is in a signaled state, QEMU will call @func.
  *
+ * If the same HANDLE is added twice, this function returns -1.
+ *
  * @handle: The Windows handle to be observed.
  * @func: A function to be called when @handle is in a signaled state.
  * @opaque: A pointer-size value that is passed to @func.
@@ -340,6 +342,35 @@ void qemu_mutex_lock_iothread_impl(const char *file, int line);
  * is a no-op there.
  */
 void qemu_mutex_unlock_iothread(void);
+
+/**
+ * QEMU_IOTHREAD_LOCK_GUARD
+ *
+ * Wrap a block of code in a conditional qemu_mutex_{lock,unlock}_iothread.
+ */
+typedef struct IOThreadLockAuto IOThreadLockAuto;
+
+static inline IOThreadLockAuto *qemu_iothread_auto_lock(const char *file,
+                                                        int line)
+{
+    if (qemu_mutex_iothread_locked()) {
+        return NULL;
+    }
+    qemu_mutex_lock_iothread_impl(file, line);
+    /* Anything non-NULL causes the cleanup function to be called */
+    return (IOThreadLockAuto *)(uintptr_t)1;
+}
+
+static inline void qemu_iothread_auto_unlock(IOThreadLockAuto *l)
+{
+    qemu_mutex_unlock_iothread();
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(IOThreadLockAuto, qemu_iothread_auto_unlock)
+
+#define QEMU_IOTHREAD_LOCK_GUARD() \
+    g_autoptr(IOThreadLockAuto) _iothread_lock_auto __attribute__((unused)) \
+        = qemu_iothread_auto_lock(__FILE__, __LINE__)
 
 /*
  * qemu_cond_wait_iothread: Wait on condition for the main loop mutex

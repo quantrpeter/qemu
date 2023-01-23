@@ -13,9 +13,10 @@
 
 #include "qemu/osdep.h"
 #include "exec/memop.h"
-#include "exec/memory-internal.h"
+#include "exec/memory.h"
 #include "qemu/error-report.h"
 #include "sysemu/hw_accel.h"
+#include "hw/pci/pci_device.h"
 #include "hw/s390x/s390-pci-inst.h"
 #include "hw/s390x/s390-pci-bus.h"
 #include "hw/s390x/s390-pci-kvm.h"
@@ -272,7 +273,7 @@ int clp_service_call(S390CPU *cpu, uint8_t r2, uintptr_t ra)
                 stw_p(&ressetpci->hdr.rsp, CLP_RC_SETPCIFN_FHOP);
                 goto out;
             }
-            device_legacy_reset(DEVICE(pbdev));
+            device_cold_reset(DEVICE(pbdev));
             pbdev->fh &= ~FH_MASK_ENABLE;
             pbdev->state = ZPCI_FS_DISABLED;
             stl_p(&ressetpci->fh, pbdev->fh);
@@ -640,6 +641,8 @@ static uint32_t s390_pci_update_iotlb(S390PCIIOMMU *iommu,
         }
         g_hash_table_remove(iommu->iotlb, &entry->iova);
         inc_dma_avail(iommu);
+        /* Don't notify the iommu yet, maybe we can bundle contiguous unmaps */
+        goto out;
     } else {
         if (cache) {
             if (cache->perm == entry->perm &&
@@ -663,22 +666,52 @@ static uint32_t s390_pci_update_iotlb(S390PCIIOMMU *iommu,
         dec_dma_avail(iommu);
     }
 
+    /*
+     * All associated iotlb entries have already been cleared, trigger the
+     * unmaps.
+     */
     memory_region_notify_iommu(&iommu->iommu_mr, 0, event);
 
 out:
     return iommu->dma_limit ? iommu->dma_limit->avail : 1;
 }
 
+static void s390_pci_batch_unmap(S390PCIIOMMU *iommu, uint64_t iova,
+                                 uint64_t len)
+{
+    uint64_t remain = len, start = iova, end = start + len - 1, mask, size;
+    IOMMUTLBEvent event = {
+        .type = IOMMU_NOTIFIER_UNMAP,
+        .entry = {
+            .target_as = &address_space_memory,
+            .translated_addr = 0,
+            .perm = IOMMU_NONE,
+        },
+    };
+
+    while (remain >= TARGET_PAGE_SIZE) {
+        mask = dma_aligned_pow2_mask(start, end, 64);
+        size = mask + 1;
+        event.entry.iova = start;
+        event.entry.addr_mask = mask;
+        memory_region_notify_iommu(&iommu->iommu_mr, 0, event);
+        start += size;
+        remain -= size;
+    }
+}
+
 int rpcit_service_call(S390CPU *cpu, uint8_t r1, uint8_t r2, uintptr_t ra)
 {
     CPUS390XState *env = &cpu->env;
+    uint64_t iova, coalesce = 0;
     uint32_t fh;
     uint16_t error = 0;
     S390PCIBusDevice *pbdev;
     S390PCIIOMMU *iommu;
     S390IOTLBEntry entry;
-    hwaddr start, end;
+    hwaddr start, end, sstart;
     uint32_t dma_avail;
+    bool again;
 
     if (env->psw.mask & PSW_MASK_PSTATE) {
         s390_program_interrupt(env, PGM_PRIVILEGED, ra);
@@ -691,7 +724,7 @@ int rpcit_service_call(S390CPU *cpu, uint8_t r1, uint8_t r2, uintptr_t ra)
     }
 
     fh = env->regs[r1] >> 32;
-    start = env->regs[r2];
+    sstart = start = env->regs[r2];
     end = start + env->regs[r2 + 1];
 
     pbdev = s390_pci_find_dev_by_fh(s390_get_phb(), fh);
@@ -732,20 +765,54 @@ int rpcit_service_call(S390CPU *cpu, uint8_t r1, uint8_t r2, uintptr_t ra)
         goto err;
     }
 
+ retry:
+    start = sstart;
+    again = false;
     while (start < end) {
         error = s390_guest_io_table_walk(iommu->g_iota, start, &entry);
         if (error) {
             break;
         }
 
+        /*
+         * If this is an unmap of a PTE, let's try to coalesce multiple unmaps
+         * into as few notifier events as possible.
+         */
+        if (entry.perm == IOMMU_NONE && entry.len == TARGET_PAGE_SIZE) {
+            if (coalesce == 0) {
+                iova = entry.iova;
+            }
+            coalesce += entry.len;
+        } else if (coalesce > 0) {
+            /* Unleash the coalesced unmap before processing a new map */
+            s390_pci_batch_unmap(iommu, iova, coalesce);
+            coalesce = 0;
+        }
+
         start += entry.len;
-        while (entry.iova < start && entry.iova < end &&
-               (dma_avail > 0 || entry.perm == IOMMU_NONE)) {
-            dma_avail = s390_pci_update_iotlb(iommu, &entry);
-            entry.iova += TARGET_PAGE_SIZE;
-            entry.translated_addr += TARGET_PAGE_SIZE;
+        while (entry.iova < start && entry.iova < end) {
+            if (dma_avail > 0 || entry.perm == IOMMU_NONE) {
+                dma_avail = s390_pci_update_iotlb(iommu, &entry);
+                entry.iova += TARGET_PAGE_SIZE;
+                entry.translated_addr += TARGET_PAGE_SIZE;
+            } else {
+                /*
+                 * We are unable to make a new mapping at this time, continue
+                 * on and hopefully free up more space.  Then attempt another
+                 * pass.
+                 */
+                again = true;
+                break;
+            }
         }
     }
+    if (coalesce) {
+            /* Unleash the coalesced unmap before finishing rpcit */
+            s390_pci_batch_unmap(iommu, iova, coalesce);
+            coalesce = 0;
+    }
+    if (again && dma_avail > 0)
+        goto retry;
 err:
     if (error) {
         pbdev->state = ZPCI_FS_ERROR;

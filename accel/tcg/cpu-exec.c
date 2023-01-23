@@ -187,13 +187,14 @@ static bool tb_lookup_cmp(const void *p, const void *d)
     const struct tb_desc *desc = d;
 
     if ((TARGET_TB_PCREL || tb_pc(tb) == desc->pc) &&
-        tb->page_addr[0] == desc->page_addr0 &&
+        tb_page_addr0(tb) == desc->page_addr0 &&
         tb->cs_base == desc->cs_base &&
         tb->flags == desc->flags &&
         tb->trace_vcpu_dstate == desc->trace_vcpu_dstate &&
         tb_cflags(tb) == desc->cflags) {
         /* check next page if needed */
-        if (tb->page_addr[1] == -1) {
+        tb_page_addr_t tb_phys_page1 = tb_page_addr1(tb);
+        if (tb_phys_page1 == -1) {
             return true;
         } else {
             tb_page_addr_t phys_page1;
@@ -210,7 +211,7 @@ static bool tb_lookup_cmp(const void *p, const void *d)
              */
             virt_page1 = TARGET_PAGE_ALIGN(desc->pc);
             phys_page1 = get_page_addr_code(desc->env, virt_page1);
-            if (tb->page_addr[1] == phys_page1) {
+            if (tb_phys_page1 == phys_page1) {
                 return true;
             }
         }
@@ -304,15 +305,11 @@ static void log_cpu_exec(target_ulong pc, CPUState *cpu,
     }
 }
 
-static bool check_for_breakpoints(CPUState *cpu, target_ulong pc,
-                                  uint32_t *cflags)
+static bool check_for_breakpoints_slow(CPUState *cpu, target_ulong pc,
+                                       uint32_t *cflags)
 {
     CPUBreakpoint *bp;
     bool match_page = false;
-
-    if (likely(QTAILQ_EMPTY(&cpu->breakpoints))) {
-        return false;
-    }
 
     /*
      * Singlestep overrides breakpoints.
@@ -372,6 +369,13 @@ static bool check_for_breakpoints(CPUState *cpu, target_ulong pc,
         *cflags = (*cflags & ~CF_COUNT_MASK) | CF_NO_GOTO_TB | 1;
     }
     return false;
+}
+
+static inline bool check_for_breakpoints(CPUState *cpu, target_ulong pc,
+                                         uint32_t *cflags)
+{
+    return unlikely(!QTAILQ_EMPTY(&cpu->breakpoints)) &&
+        check_for_breakpoints_slow(cpu, pc, cflags);
 }
 
 /**
@@ -568,15 +572,18 @@ void cpu_exec_step_atomic(CPUState *cpu)
 
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 {
-    if (TCG_TARGET_HAS_direct_jump) {
-        uintptr_t offset = tb->jmp_target_arg[n];
-        uintptr_t tc_ptr = (uintptr_t)tb->tc.ptr;
-        uintptr_t jmp_rx = tc_ptr + offset;
-        uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
-        tb_target_set_jmp_target(tc_ptr, jmp_rx, jmp_rw, addr);
-    } else {
-        tb->jmp_target_arg[n] = addr;
-    }
+    /*
+     * Get the rx view of the structure, from which we find the
+     * executable code address, and tb_target_set_jmp_target can
+     * produce a pc-relative displacement to jmp_target_addr[n].
+     */
+    const TranslationBlock *c_tb = tcg_splitwx_to_rx(tb);
+    uintptr_t offset = tb->jmp_insn_offset[n];
+    uintptr_t jmp_rx = (uintptr_t)tb->tc.ptr + offset;
+    uintptr_t jmp_rw = jmp_rx - tcg_splitwx_diff;
+
+    tb->jmp_target_addr[n] = addr;
+    tb_target_set_jmp_target(c_tb, n, jmp_rx, jmp_rw);
 }
 
 static inline void tb_add_jump(TranslationBlock *tb, int n,
@@ -905,64 +912,10 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 
 /* main execution loop */
 
-int cpu_exec(CPUState *cpu)
+static int __attribute__((noinline))
+cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 {
     int ret;
-    SyncClocks sc = { 0 };
-
-    /* replay_interrupt may need current_cpu */
-    current_cpu = cpu;
-
-    if (cpu_handle_halt(cpu)) {
-        return EXCP_HALTED;
-    }
-
-    rcu_read_lock();
-
-    cpu_exec_enter(cpu);
-
-    /* Calculate difference between guest clock and host clock.
-     * This delay includes the delay of the last cycle, so
-     * what we have to do is sleep until it is 0. As for the
-     * advance/delay we gain here, we try to fix it next time.
-     */
-    init_delay_params(&sc, cpu);
-
-    /* prepare setjmp context for exception handling */
-    if (sigsetjmp(cpu->jmp_env, 0) != 0) {
-#if defined(__clang__)
-        /*
-         * Some compilers wrongly smash all local variables after
-         * siglongjmp (the spec requires that only non-volatile locals
-         * which are changed between the sigsetjmp and siglongjmp are
-         * permitted to be trashed). There were bug reports for gcc
-         * 4.5.0 and clang.  The bug is fixed in all versions of gcc
-         * that we support, but is still unfixed in clang:
-         *   https://bugs.llvm.org/show_bug.cgi?id=21183
-         *
-         * Reload an essential local variable here for those compilers.
-         * Newer versions of gcc would complain about this code (-Wclobbered),
-         * so we only perform the workaround for clang.
-         */
-        cpu = current_cpu;
-#else
-        /* Non-buggy compilers preserve this; assert the correct value. */
-        g_assert(cpu == current_cpu);
-#endif
-
-#ifndef CONFIG_SOFTMMU
-        clear_helper_retaddr();
-        if (have_mmap_lock()) {
-            mmap_unlock();
-        }
-#endif
-        if (qemu_mutex_iothread_locked()) {
-            qemu_mutex_unlock_iothread();
-        }
-        qemu_plugin_disable_mem_helpers(cpu);
-
-        assert_no_pages_locked();
-    }
 
     /* if an exception is pending, we execute it here */
     while (!cpu_handle_exception(cpu, &ret)) {
@@ -1016,7 +969,7 @@ int cpu_exec(CPUState *cpu)
              * direct jump to a TB spanning two pages because the mapping
              * for the second page can change.
              */
-            if (tb->page_addr[1] != -1) {
+            if (tb_page_addr1(tb) != -1) {
                 last_tb = NULL;
             }
 #endif
@@ -1029,9 +982,60 @@ int cpu_exec(CPUState *cpu)
 
             /* Try to align the host and virtual clocks
                if the guest is in advance */
-            align_clocks(&sc, cpu);
+            align_clocks(sc, cpu);
         }
     }
+    return ret;
+}
+
+static int cpu_exec_setjmp(CPUState *cpu, SyncClocks *sc)
+{
+    /* Prepare setjmp context for exception handling. */
+    if (unlikely(sigsetjmp(cpu->jmp_env, 0) != 0)) {
+        /* Non-buggy compilers preserve this; assert the correct value. */
+        g_assert(cpu == current_cpu);
+
+#ifndef CONFIG_SOFTMMU
+        clear_helper_retaddr();
+        if (have_mmap_lock()) {
+            mmap_unlock();
+        }
+#endif
+        if (qemu_mutex_iothread_locked()) {
+            qemu_mutex_unlock_iothread();
+        }
+        qemu_plugin_disable_mem_helpers(cpu);
+
+        assert_no_pages_locked();
+    }
+
+    return cpu_exec_loop(cpu, sc);
+}
+
+int cpu_exec(CPUState *cpu)
+{
+    int ret;
+    SyncClocks sc = { 0 };
+
+    /* replay_interrupt may need current_cpu */
+    current_cpu = cpu;
+
+    if (cpu_handle_halt(cpu)) {
+        return EXCP_HALTED;
+    }
+
+    rcu_read_lock();
+    cpu_exec_enter(cpu);
+
+    /*
+     * Calculate difference between guest clock and host clock.
+     * This delay includes the delay of the last cycle, so
+     * what we have to do is sleep until it is 0. As for the
+     * advance/delay we gain here, we try to fix it next time.
+     */
+    init_delay_params(&sc, cpu);
+
+    ret = cpu_exec_setjmp(cpu, &sc);
 
     cpu_exec_exit(cpu);
     rcu_read_unlock();
@@ -1048,23 +1052,25 @@ void tcg_exec_realizefn(CPUState *cpu, Error **errp)
         cc->tcg_ops->initialize();
         tcg_target_initialized = true;
     }
-    tlb_init(cpu);
-    qemu_plugin_vcpu_init_hook(cpu);
 
+    cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);
+    tlb_init(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_init_notifier_list(cpu);
 #endif /* !CONFIG_USER_ONLY */
+    /* qemu_plugin_vcpu_init_hook delayed until cpu_index assigned. */
 }
 
 /* undo the initializations in reverse order */
 void tcg_exec_unrealizefn(CPUState *cpu)
 {
+    qemu_plugin_vcpu_exit_hook(cpu);
 #ifndef CONFIG_USER_ONLY
     tcg_iommu_free_notifier_list(cpu);
 #endif /* !CONFIG_USER_ONLY */
 
-    qemu_plugin_vcpu_exit_hook(cpu);
     tlb_destroy(cpu);
+    g_free(cpu->tb_jmp_cache);
 }
 
 #ifndef CONFIG_USER_ONLY

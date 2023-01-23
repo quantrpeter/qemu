@@ -37,6 +37,7 @@
 #include "exec/gdbstub.h"
 #include "qemu/host-utils.h"
 #include "qemu/main-loop.h"
+#include "qemu/ratelimit.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
 #include "qemu/memalign.h"
@@ -2203,20 +2204,30 @@ void kvm_arch_reset_vcpu(X86CPU *cpu)
         env->mp_state = KVM_MP_STATE_RUNNABLE;
     }
 
-    if (hyperv_feat_enabled(cpu, HYPERV_FEAT_SYNIC)) {
-        int i;
-        for (i = 0; i < ARRAY_SIZE(env->msr_hv_synic_sint); i++) {
-            env->msr_hv_synic_sint[i] = HV_SINT_MASKED;
-        }
-
-        hyperv_x86_synic_reset(cpu);
-    }
     /* enabled by default */
     env->poll_control_msr = 1;
 
     kvm_init_nested_state(env);
 
     sev_es_set_reset_vector(CPU(cpu));
+}
+
+void kvm_arch_after_reset_vcpu(X86CPU *cpu)
+{
+    CPUX86State *env = &cpu->env;
+    int i;
+
+    /*
+     * Reset SynIC after all other devices have been reset to let them remove
+     * their SINT routes first.
+     */
+    if (hyperv_feat_enabled(cpu, HYPERV_FEAT_SYNIC)) {
+        for (i = 0; i < ARRAY_SIZE(env->msr_hv_synic_sint); i++) {
+            env->msr_hv_synic_sint[i] = HV_SINT_MASKED;
+        }
+
+        hyperv_x86_synic_reset(cpu);
+    }
 }
 
 void kvm_arch_do_init_vcpu(X86CPU *cpu)
@@ -2252,8 +2263,7 @@ static int kvm_get_supported_feature_msrs(KVMState *s)
     }
 
     assert(msr_list.nmsrs > 0);
-    kvm_feature_msrs = (struct kvm_msr_list *) \
-        g_malloc0(sizeof(msr_list) +
+    kvm_feature_msrs = g_malloc0(sizeof(msr_list) +
                  msr_list.nmsrs * sizeof(msr_list.indices[0]));
 
     kvm_feature_msrs->nmsrs = msr_list.nmsrs;
@@ -5680,7 +5690,6 @@ static void kvm_arch_set_notify_window(Object *obj, Visitor *v,
                                        Error **errp)
 {
     KVMState *s = KVM_STATE(obj);
-    Error *error = NULL;
     uint32_t value;
 
     if (s->fd != -1) {
@@ -5688,9 +5697,7 @@ static void kvm_arch_set_notify_window(Object *obj, Visitor *v,
         return;
     }
 
-    visit_type_uint32(v, name, &value, &error);
-    if (error) {
-        error_propagate(errp, error);
+    if (!visit_type_uint32(v, name, &value, errp)) {
         return;
     }
 
@@ -5713,4 +5720,9 @@ void kvm_arch_accel_class_init(ObjectClass *oc)
     object_class_property_set_description(oc, "notify-window",
                                           "Clock cycles without an event window "
                                           "after which a notification VM exit occurs");
+}
+
+void kvm_set_max_apic_id(uint32_t max_apic_id)
+{
+    kvm_vm_enable_cap(kvm_state, KVM_CAP_MAX_VCPU_ID, 0, max_apic_id);
 }

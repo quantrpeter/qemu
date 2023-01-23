@@ -1763,7 +1763,7 @@ static void gd_vc_send_chars(VirtualConsole *vc)
         uint32_t size;
 
         buf = fifo8_pop_buf(&vc->vte.out_fifo, MIN(len, avail), &size);
-        qemu_chr_be_write(vc->vte.chr, (uint8_t *)buf, size);
+        qemu_chr_be_write(vc->vte.chr, buf, size);
         len = qemu_chr_be_can_write(vc->vte.chr);
         avail -= size;
     }
@@ -2403,7 +2403,9 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
         opts->u.gtk.show_tabs) {
         gtk_menu_item_activate(GTK_MENU_ITEM(s->show_tabs_item));
     }
+#ifdef CONFIG_GTK_CLIPBOARD
     gd_clipboard_init(s);
+#endif /* CONFIG_GTK_CLIPBOARD */
 }
 
 static void early_gtk_display_init(DisplayOptions *opts)

@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "block/aio-wait.h"
 #include "block/block.h"
 #include "block/blockjob_int.h"
 #include "block/block_int.h"
@@ -32,7 +33,6 @@
 #include "qapi/error.h"
 #include "qapi/qapi-events-block-core.h"
 #include "qapi/qmp/qerror.h"
-#include "qemu/coroutine.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 
@@ -120,49 +120,61 @@ static bool child_job_drained_poll(BdrvChild *c)
     }
 }
 
-static void child_job_drained_end(BdrvChild *c, int *drained_end_counter)
+static void child_job_drained_end(BdrvChild *c)
 {
     BlockJob *job = c->opaque;
     job_resume(&job->job);
 }
 
-static bool child_job_can_set_aio_ctx(BdrvChild *c, AioContext *ctx,
-                                      GSList **ignore, Error **errp)
+typedef struct BdrvStateChildJobContext {
+    AioContext *new_ctx;
+    BlockJob *job;
+} BdrvStateChildJobContext;
+
+static void child_job_set_aio_ctx_commit(void *opaque)
+{
+    BdrvStateChildJobContext *s = opaque;
+    BlockJob *job = s->job;
+
+    job_set_aio_context(&job->job, s->new_ctx);
+}
+
+static TransactionActionDrv change_child_job_context = {
+    .commit = child_job_set_aio_ctx_commit,
+    .clean = g_free,
+};
+
+static bool child_job_change_aio_ctx(BdrvChild *c, AioContext *ctx,
+                                     GHashTable *visited, Transaction *tran,
+                                     Error **errp)
 {
     BlockJob *job = c->opaque;
+    BdrvStateChildJobContext *s;
     GSList *l;
 
     for (l = job->nodes; l; l = l->next) {
         BdrvChild *sibling = l->data;
-        if (!bdrv_child_can_set_aio_context(sibling, ctx, ignore, errp)) {
+        if (!bdrv_child_change_aio_context(sibling, ctx, visited,
+                                           tran, errp)) {
             return false;
         }
     }
+
+    s = g_new(BdrvStateChildJobContext, 1);
+    *s = (BdrvStateChildJobContext) {
+        .new_ctx = ctx,
+        .job = job,
+    };
+
+    tran_add(tran, &change_child_job_context, s);
     return true;
-}
-
-static void child_job_set_aio_ctx(BdrvChild *c, AioContext *ctx,
-                                  GSList **ignore)
-{
-    BlockJob *job = c->opaque;
-    GSList *l;
-
-    for (l = job->nodes; l; l = l->next) {
-        BdrvChild *sibling = l->data;
-        if (g_slist_find(*ignore, sibling)) {
-            continue;
-        }
-        *ignore = g_slist_prepend(*ignore, sibling);
-        bdrv_set_aio_context_ignore(sibling->bs, ctx, ignore);
-    }
-
-    job_set_aio_context(&job->job, ctx);
 }
 
 static AioContext *child_job_get_parent_aio_context(BdrvChild *c)
 {
     BlockJob *job = c->opaque;
-    GLOBAL_STATE_CODE();
+    IO_CODE();
+    JOB_LOCK_GUARD();
 
     return job->job.aio_context;
 }
@@ -172,8 +184,7 @@ static const BdrvChildClass child_job = {
     .drained_begin      = child_job_drained_begin,
     .drained_poll       = child_job_drained_poll,
     .drained_end        = child_job_drained_end,
-    .can_set_aio_ctx    = child_job_can_set_aio_ctx,
-    .set_aio_ctx        = child_job_set_aio_ctx,
+    .change_aio_ctx     = child_job_change_aio_ctx,
     .stay_at_node       = true,
     .get_parent_aio_context = child_job_get_parent_aio_context,
 };
@@ -343,7 +354,6 @@ BlockJobInfo *block_job_query_locked(BlockJob *job, Error **errp)
     info->auto_finalize = job->job.auto_finalize;
     info->auto_dismiss  = job->job.auto_dismiss;
     if (job->job.ret) {
-        info->has_error = true;
         info->error = job->job.err ?
                         g_strdup(error_get_pretty(job->job.err)) :
                         g_strdup(strerror(-job->job.ret));
@@ -403,7 +413,6 @@ static void block_job_event_completed_locked(Notifier *n, void *opaque)
                                         progress_total,
                                         progress_current,
                                         job->speed,
-                                        !!msg,
                                         msg);
 }
 

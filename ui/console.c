@@ -27,6 +27,7 @@
 #include "hw/qdev-core.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
+#include "qemu/coroutine.h"
 #include "qemu/fifo8.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
@@ -407,7 +408,7 @@ static void graphic_hw_update_bh(void *con)
 
 /* Safety: coroutine-only, concurrent-coroutine safe, main thread only */
 void coroutine_fn
-qmp_screendump(const char *filename, bool has_device, const char *device,
+qmp_screendump(const char *filename, const char *device,
                bool has_head, int64_t head,
                bool has_format, ImageFormat format, Error **errp)
 {
@@ -416,7 +417,7 @@ qmp_screendump(const char *filename, bool has_device, const char *device,
     DisplaySurface *surface;
     int fd;
 
-    if (has_device) {
+    if (device) {
         con = qemu_console_lookup_by_device_name(device, has_head ? head : 0,
                                                  errp);
         if (!con) {
@@ -1297,7 +1298,7 @@ static void kbd_send_chars(QemuConsole *s)
         uint32_t size;
 
         buf = fifo8_pop_buf(&s->out_fifo, MIN(len, avail), &size);
-        qemu_chr_be_write(s->chr, (uint8_t *)buf, size);
+        qemu_chr_be_write(s->chr, buf, size);
         len = qemu_chr_be_can_write(s->chr);
         avail -= size;
     }
@@ -2632,7 +2633,11 @@ bool qemu_display_find_default(DisplayOptions *opts)
 
     for (i = 0; i < (int)ARRAY_SIZE(prio); i++) {
         if (dpys[prio[i]] == NULL) {
-            ui_module_load_one(DisplayType_str(prio[i]));
+            Error *local_err = NULL;
+            int rv = ui_module_load(DisplayType_str(prio[i]), &local_err);
+            if (rv < 0) {
+                error_report_err(local_err);
+            }
         }
         if (dpys[prio[i]] == NULL) {
             continue;
@@ -2650,7 +2655,11 @@ void qemu_display_early_init(DisplayOptions *opts)
         return;
     }
     if (dpys[opts->type] == NULL) {
-        ui_module_load_one(DisplayType_str(opts->type));
+        Error *local_err = NULL;
+        int rv = ui_module_load(DisplayType_str(opts->type), &local_err);
+        if (rv < 0) {
+            error_report_err(local_err);
+        }
     }
     if (dpys[opts->type] == NULL) {
         error_report("Display '%s' is not available.",
@@ -2680,7 +2689,11 @@ void qemu_display_help(void)
     printf("none\n");
     for (idx = DISPLAY_TYPE_NONE; idx < DISPLAY_TYPE__MAX; idx++) {
         if (!dpys[idx]) {
-            ui_module_load_one(DisplayType_str(idx));
+            Error *local_err = NULL;
+            int rv = ui_module_load(DisplayType_str(idx), &local_err);
+            if (rv < 0) {
+                error_report_err(local_err);
+            }
         }
         if (dpys[idx]) {
             printf("%s\n",  DisplayType_str(dpys[idx]->type));

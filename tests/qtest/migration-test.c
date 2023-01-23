@@ -1066,15 +1066,27 @@ test_migrate_tls_x509_finish(QTestState *from,
     TestMigrateTLSX509Data *data = opaque;
 
     test_tls_cleanup(data->keyfile);
-    unlink(data->cacert);
-    unlink(data->servercert);
-    unlink(data->serverkey);
-    unlink(data->clientcert);
-    unlink(data->clientkey);
-    rmdir(data->workdir);
-
-    g_free(data->workdir);
     g_free(data->keyfile);
+
+    unlink(data->cacert);
+    g_free(data->cacert);
+    unlink(data->servercert);
+    g_free(data->servercert);
+    unlink(data->serverkey);
+    g_free(data->serverkey);
+
+    if (data->clientcert) {
+        unlink(data->clientcert);
+        g_free(data->clientcert);
+    }
+    if (data->clientkey) {
+        unlink(data->clientkey);
+        g_free(data->clientkey);
+    }
+
+    rmdir(data->workdir);
+    g_free(data->workdir);
+
     g_free(data);
 }
 #endif /* CONFIG_TASN1 */
@@ -1342,7 +1354,7 @@ static void test_precopy_common(MigrateCommon *args)
         wait_for_migration_fail(from, allow_active);
 
         if (args->result == MIG_TEST_FAIL_DEST_QUIT_ERR) {
-            qtest_set_expected_status(to, 1);
+            qtest_set_expected_status(to, EXIT_FAILURE);
         }
     } else {
         if (args->iterations) {
@@ -1402,7 +1414,6 @@ static void test_precopy_unix_dirty_ring(void)
 }
 
 #ifdef CONFIG_GNUTLS
-#ifndef _WIN32
 static void test_precopy_unix_tls_psk(void)
 {
     g_autofree char *uri = g_strdup_printf("unix:%s/migsocket", tmpfs);
@@ -1415,7 +1426,6 @@ static void test_precopy_unix_tls_psk(void)
 
     test_precopy_common(&args);
 }
-#endif /* _WIN32 */
 
 #ifdef CONFIG_TASN1
 static void test_precopy_unix_tls_x509_default_host(void)
@@ -1524,7 +1534,6 @@ static void test_precopy_tcp_plain(void)
 }
 
 #ifdef CONFIG_GNUTLS
-#ifndef _WIN32
 static void test_precopy_tcp_tls_psk_match(void)
 {
     MigrateCommon args = {
@@ -1535,7 +1544,6 @@ static void test_precopy_tcp_tls_psk_match(void)
 
     test_precopy_common(&args);
 }
-#endif /* _WIN32 */
 
 static void test_precopy_tcp_tls_psk_mismatch(void)
 {
@@ -1653,7 +1661,7 @@ static void *test_migrate_fd_start_hook(QTestState *from,
     int pair[2];
 
     /* Create two connected sockets for migration */
-    ret = socketpair(PF_LOCAL, SOCK_STREAM, 0, pair);
+    ret = qemu_socketpair(PF_LOCAL, SOCK_STREAM, 0, pair);
     g_assert_cmpint(ret, ==, 0);
 
     /* Send the 1st socket to the target */
@@ -1738,7 +1746,7 @@ static void do_test_validate_uuid(MigrateStart *args, bool should_fail)
     migrate_qmp(from, uri, "{}");
 
     if (should_fail) {
-        qtest_set_expected_status(to, 1);
+        qtest_set_expected_status(to, EXIT_FAILURE);
         wait_for_migration_fail(from, true);
     } else {
         wait_for_migration_complete(from);
@@ -1933,7 +1941,6 @@ static void test_multifd_tcp_zstd(void)
 #endif
 
 #ifdef CONFIG_GNUTLS
-#ifndef _WIN32
 static void *
 test_migrate_multifd_tcp_tls_psk_start_match(QTestState *from,
                                              QTestState *to)
@@ -1941,7 +1948,6 @@ test_migrate_multifd_tcp_tls_psk_start_match(QTestState *from,
     test_migrate_precopy_tcp_multifd_start_common(from, to, "none");
     return test_migrate_tls_psk_start_match(from, to);
 }
-#endif /* _WIN32 */
 
 static void *
 test_migrate_multifd_tcp_tls_psk_start_mismatch(QTestState *from,
@@ -1993,7 +1999,6 @@ test_migrate_multifd_tls_x509_start_reject_anon_client(QTestState *from,
 }
 #endif /* CONFIG_TASN1 */
 
-#ifndef _WIN32
 static void test_multifd_tcp_tls_psk_match(void)
 {
     MigrateCommon args = {
@@ -2003,7 +2008,6 @@ static void test_multifd_tcp_tls_psk_match(void)
     };
     test_precopy_common(&args);
 }
-#endif /* _WIN32 */
 
 static void test_multifd_tcp_tls_psk_mismatch(void)
 {
@@ -2141,6 +2145,10 @@ static void test_multifd_tcp_cancel(void)
 
     migrate_cancel(from);
 
+    /* Make sure QEMU process "to" exited */
+    qtest_set_expected_status(to, EXIT_FAILURE);
+    qtest_wait_qemu(to);
+
     args = (MigrateStart){
         .only_target = true,
     };
@@ -2184,7 +2192,7 @@ static void calc_dirty_rate(QTestState *who, uint64_t calc_time)
     qobject_unref(qmp_command(who,
                   "{ 'execute': 'calc-dirty-rate',"
                   "'arguments': { "
-                  "'calc-time': %ld,"
+                  "'calc-time': %" PRIu64 ","
                   "'mode': 'dirty-ring' }}",
                   calc_time));
 }
@@ -2199,7 +2207,7 @@ static void dirtylimit_set_all(QTestState *who, uint64_t dirtyrate)
     qobject_unref(qmp_command(who,
                   "{ 'execute': 'set-vcpu-dirty-limit',"
                   "'arguments': { "
-                  "'dirty-rate': %ld } }",
+                  "'dirty-rate': %" PRIu64 " } }",
                   dirtyrate));
 }
 
@@ -2481,8 +2489,8 @@ int main(int argc, char **argv)
 
     tmpfs = g_dir_make_tmp("migration-test-XXXXXX", &err);
     if (!tmpfs) {
-        g_test_message("g_dir_make_tmp on path (%s): %s", tmpfs,
-                       err->message);
+        g_test_message("Can't create temporary directory in %s: %s",
+                       g_get_tmp_dir(), err->message);
     }
     g_assert(tmpfs);
 
@@ -2501,10 +2509,8 @@ int main(int argc, char **argv)
     qtest_add_func("/migration/precopy/unix/plain", test_precopy_unix_plain);
     qtest_add_func("/migration/precopy/unix/xbzrle", test_precopy_unix_xbzrle);
 #ifdef CONFIG_GNUTLS
-#ifndef _WIN32
     qtest_add_func("/migration/precopy/unix/tls/psk",
                    test_precopy_unix_tls_psk);
-#endif
 
     if (has_uffd) {
         /*
@@ -2530,10 +2536,8 @@ int main(int argc, char **argv)
 
     qtest_add_func("/migration/precopy/tcp/plain", test_precopy_tcp_plain);
 #ifdef CONFIG_GNUTLS
-#ifndef _WIN32
     qtest_add_func("/migration/precopy/tcp/tls/psk/match",
                    test_precopy_tcp_tls_psk_match);
-#endif
     qtest_add_func("/migration/precopy/tcp/tls/psk/mismatch",
                    test_precopy_tcp_tls_psk_mismatch);
 #ifdef CONFIG_TASN1
@@ -2577,10 +2581,8 @@ int main(int argc, char **argv)
                    test_multifd_tcp_zstd);
 #endif
 #ifdef CONFIG_GNUTLS
-#ifndef _WIN32
     qtest_add_func("/migration/multifd/tcp/tls/psk/match",
                    test_multifd_tcp_tls_psk_match);
-#endif
     qtest_add_func("/migration/multifd/tcp/tls/psk/mismatch",
                    test_multifd_tcp_tls_psk_mismatch);
 #ifdef CONFIG_TASN1

@@ -18,6 +18,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "block/block-io.h"
+#include "block/block_int.h"
 #include "block/throttle-groups.h"
 #include "qemu/module.h"
 #include "qemu/option.h"
@@ -78,11 +80,9 @@ static int throttle_open(BlockDriverState *bs, QDict *options,
     char *group;
     int ret;
 
-    bs->file = bdrv_open_child(NULL, options, "file", bs, &child_of_bds,
-                               BDRV_CHILD_FILTERED | BDRV_CHILD_PRIMARY,
-                               false, errp);
-    if (!bs->file) {
-        return -EINVAL;
+    ret = bdrv_open_file_child(NULL, options, "file", bs, errp);
+    if (ret < 0) {
+        return ret;
     }
     bs->supported_write_flags = bs->file->bs->supported_write_flags |
                                 BDRV_REQ_WRITE_UNCHANGED;
@@ -216,7 +216,7 @@ static void throttle_reopen_abort(BDRVReopenState *reopen_state)
     reopen_state->opaque = NULL;
 }
 
-static void coroutine_fn throttle_co_drain_begin(BlockDriverState *bs)
+static void throttle_drain_begin(BlockDriverState *bs)
 {
     ThrottleGroupMember *tgm = bs->opaque;
     if (qatomic_fetch_inc(&tgm->io_limits_disabled) == 0) {
@@ -224,7 +224,7 @@ static void coroutine_fn throttle_co_drain_begin(BlockDriverState *bs)
     }
 }
 
-static void coroutine_fn throttle_co_drain_end(BlockDriverState *bs)
+static void throttle_drain_end(BlockDriverState *bs)
 {
     ThrottleGroupMember *tgm = bs->opaque;
     assert(tgm->io_limits_disabled);
@@ -263,8 +263,8 @@ static BlockDriver bdrv_throttle = {
     .bdrv_reopen_commit                 =   throttle_reopen_commit,
     .bdrv_reopen_abort                  =   throttle_reopen_abort,
 
-    .bdrv_co_drain_begin                =   throttle_co_drain_begin,
-    .bdrv_co_drain_end                  =   throttle_co_drain_end,
+    .bdrv_drain_begin                   =   throttle_drain_begin,
+    .bdrv_drain_end                     =   throttle_drain_end,
 
     .is_filter                          =   true,
     .strong_runtime_opts                =   throttle_strong_runtime_opts,

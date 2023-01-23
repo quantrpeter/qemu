@@ -27,6 +27,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "block/block-io.h"
 #include "block/block_int.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
@@ -258,6 +259,8 @@ static int coroutine_fn raw_co_pwritev(BlockDriverState *bs, int64_t offset,
         qemu_iovec_add(&local_qiov, buf, 512);
         qemu_iovec_concat(&local_qiov, qiov, 512, qiov->size - 512);
         qiov = &local_qiov;
+
+        flags &= ~BDRV_REQ_REGISTERED_BUF;
     }
 
     ret = raw_adjust_offset(bs, &offset, bytes, true);
@@ -431,7 +434,7 @@ static int coroutine_fn raw_co_create_opts(BlockDriver *drv,
                                            QemuOpts *opts,
                                            Error **errp)
 {
-    return bdrv_create_file(filename, opts, errp);
+    return bdrv_co_create_file(filename, opts, errp);
 }
 
 static int raw_open(BlockDriverState *bs, QDict *options, int flags,
@@ -458,8 +461,8 @@ static int raw_open(BlockDriverState *bs, QDict *options, int flags,
         file_role = BDRV_CHILD_FILTERED | BDRV_CHILD_PRIMARY;
     }
 
-    bs->file = bdrv_open_child(NULL, options, "file", bs, &child_of_bds,
-                               file_role, false, errp);
+    bdrv_open_child(NULL, options, "file", bs, &child_of_bds,
+                    file_role, false, errp);
     if (!bs->file) {
         return -EINVAL;
     }

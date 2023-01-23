@@ -32,7 +32,8 @@
 #define ST(n)  (env->fpregs[(env->fpstt + (n)) & 7].d)
 #define ST1    ST(1)
 
-#define FPU_RC_MASK         0xc00
+#define FPU_RC_SHIFT        10
+#define FPU_RC_MASK         (3 << FPU_RC_SHIFT)
 #define FPU_RC_NEAR         0x000
 #define FPU_RC_DOWN         0x400
 #define FPU_RC_UP           0x800
@@ -685,28 +686,26 @@ uint32_t helper_fnstcw(CPUX86State *env)
     return env->fpuc;
 }
 
+static void set_x86_rounding_mode(unsigned mode, float_status *status)
+{
+    static FloatRoundMode x86_round_mode[4] = {
+        float_round_nearest_even,
+        float_round_down,
+        float_round_up,
+        float_round_to_zero
+    };
+    assert(mode < ARRAY_SIZE(x86_round_mode));
+    set_float_rounding_mode(x86_round_mode[mode], status);
+}
+
 void update_fp_status(CPUX86State *env)
 {
-    FloatRoundMode rnd_mode;
+    int rnd_mode;
     FloatX80RoundPrec rnd_prec;
 
     /* set rounding mode */
-    switch (env->fpuc & FPU_RC_MASK) {
-    default:
-    case FPU_RC_NEAR:
-        rnd_mode = float_round_nearest_even;
-        break;
-    case FPU_RC_DOWN:
-        rnd_mode = float_round_down;
-        break;
-    case FPU_RC_UP:
-        rnd_mode = float_round_up;
-        break;
-    case FPU_RC_CHOP:
-        rnd_mode = float_round_to_zero;
-        break;
-    }
-    set_float_rounding_mode(rnd_mode, &env->fp_status);
+    rnd_mode = (env->fpuc & FPU_RC_MASK) >> FPU_RC_SHIFT;
+    set_x86_rounding_mode(rnd_mode, &env->fp_status);
 
     switch ((env->fpuc >> 8) & 3) {
     case 0:
@@ -2559,6 +2558,22 @@ static void do_xsave_sse(CPUX86State *env, target_ulong ptr, uintptr_t ra)
     }
 }
 
+static void do_xsave_ymmh(CPUX86State *env, target_ulong ptr, uintptr_t ra)
+{
+    int i, nb_xmm_regs;
+
+    if (env->hflags & HF_CS64_MASK) {
+        nb_xmm_regs = 16;
+    } else {
+        nb_xmm_regs = 8;
+    }
+
+    for (i = 0; i < nb_xmm_regs; i++, ptr += 16) {
+        cpu_stq_data_ra(env, ptr, env->xmm_regs[i].ZMM_Q(2), ra);
+        cpu_stq_data_ra(env, ptr + 8, env->xmm_regs[i].ZMM_Q(3), ra);
+    }
+}
+
 static void do_xsave_bndregs(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
     target_ulong addr = ptr + offsetof(XSaveBNDREG, bnd_regs);
@@ -2651,6 +2666,9 @@ static void do_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     if (opt & XSTATE_SSE_MASK) {
         do_xsave_sse(env, ptr, ra);
     }
+    if (opt & XSTATE_YMM_MASK) {
+        do_xsave_ymmh(env, ptr + XO(avx_state), ra);
+    }
     if (opt & XSTATE_BNDREGS_MASK) {
         do_xsave_bndregs(env, ptr + XO(bndreg_state), ra);
     }
@@ -2722,6 +2740,54 @@ static void do_xrstor_sse(CPUX86State *env, target_ulong ptr, uintptr_t ra)
         env->xmm_regs[i].ZMM_Q(0) = cpu_ldq_data_ra(env, addr, ra);
         env->xmm_regs[i].ZMM_Q(1) = cpu_ldq_data_ra(env, addr + 8, ra);
         addr += 16;
+    }
+}
+
+static void do_clear_sse(CPUX86State *env)
+{
+    int i, nb_xmm_regs;
+
+    if (env->hflags & HF_CS64_MASK) {
+        nb_xmm_regs = 16;
+    } else {
+        nb_xmm_regs = 8;
+    }
+
+    for (i = 0; i < nb_xmm_regs; i++) {
+        env->xmm_regs[i].ZMM_Q(0) = 0;
+        env->xmm_regs[i].ZMM_Q(1) = 0;
+    }
+}
+
+static void do_xrstor_ymmh(CPUX86State *env, target_ulong ptr, uintptr_t ra)
+{
+    int i, nb_xmm_regs;
+
+    if (env->hflags & HF_CS64_MASK) {
+        nb_xmm_regs = 16;
+    } else {
+        nb_xmm_regs = 8;
+    }
+
+    for (i = 0; i < nb_xmm_regs; i++, ptr += 16) {
+        env->xmm_regs[i].ZMM_Q(2) = cpu_ldq_data_ra(env, ptr, ra);
+        env->xmm_regs[i].ZMM_Q(3) = cpu_ldq_data_ra(env, ptr + 8, ra);
+    }
+}
+
+static void do_clear_ymmh(CPUX86State *env)
+{
+    int i, nb_xmm_regs;
+
+    if (env->hflags & HF_CS64_MASK) {
+        nb_xmm_regs = 16;
+    } else {
+        nb_xmm_regs = 8;
+    }
+
+    for (i = 0; i < nb_xmm_regs; i++) {
+        env->xmm_regs[i].ZMM_Q(2) = 0;
+        env->xmm_regs[i].ZMM_Q(3) = 0;
     }
 }
 
@@ -2831,9 +2897,14 @@ static void do_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm, uintptr
         if (xstate_bv & XSTATE_SSE_MASK) {
             do_xrstor_sse(env, ptr, ra);
         } else {
-            /* ??? When AVX is implemented, we may have to be more
-               selective in the clearing.  */
-            memset(env->xmm_regs, 0, sizeof(env->xmm_regs));
+            do_clear_sse(env);
+        }
+    }
+    if (rfbm & XSTATE_YMM_MASK) {
+        if (xstate_bv & XSTATE_YMM_MASK) {
+            do_xrstor_ymmh(env, ptr + XO(avx_state), ra);
+        } else {
+            do_clear_ymmh(env);
         }
     }
     if (rfbm & XSTATE_BNDREGS_MASK) {
@@ -2955,6 +3026,7 @@ void helper_xsetbv(CPUX86State *env, uint32_t ecx, uint64_t mask)
 
     env->xcr0 = mask;
     cpu_sync_bndcs_hflags(env);
+    cpu_sync_avx_hflag(env);
     return;
 
  do_gpf:
@@ -2965,11 +3037,8 @@ void helper_xsetbv(CPUX86State *env, uint32_t ecx, uint64_t mask)
 /* XXX: optimize by storing fptt and fptags in the static cpu state */
 
 #define SSE_DAZ             0x0040
-#define SSE_RC_MASK         0x6000
-#define SSE_RC_NEAR         0x0000
-#define SSE_RC_DOWN         0x2000
-#define SSE_RC_UP           0x4000
-#define SSE_RC_CHOP         0x6000
+#define SSE_RC_SHIFT        13
+#define SSE_RC_MASK         (3 << SSE_RC_SHIFT)
 #define SSE_FZ              0x8000
 
 void update_mxcsr_status(CPUX86State *env)
@@ -2978,22 +3047,8 @@ void update_mxcsr_status(CPUX86State *env)
     int rnd_type;
 
     /* set rounding mode */
-    switch (mxcsr & SSE_RC_MASK) {
-    default:
-    case SSE_RC_NEAR:
-        rnd_type = float_round_nearest_even;
-        break;
-    case SSE_RC_DOWN:
-        rnd_type = float_round_down;
-        break;
-    case SSE_RC_UP:
-        rnd_type = float_round_up;
-        break;
-    case SSE_RC_CHOP:
-        rnd_type = float_round_to_zero;
-        break;
-    }
-    set_float_rounding_mode(rnd_type, &env->sse_status);
+    rnd_type = (mxcsr & SSE_RC_MASK) >> SSE_RC_SHIFT;
+    set_x86_rounding_mode(rnd_type, &env->sse_status);
 
     /* Set exception flags.  */
     set_float_exception_flags((mxcsr & FPUS_IE ? float_flag_invalid : 0) |
@@ -3053,14 +3108,11 @@ void helper_emms(CPUX86State *env)
     *(uint32_t *)(env->fptags + 4) = 0x01010101;
 }
 
-/* XXX: suppress */
-void helper_movq(CPUX86State *env, void *d, void *s)
-{
-    *(uint64_t *)d = *(uint64_t *)s;
-}
-
 #define SHIFT 0
 #include "ops_sse.h"
 
 #define SHIFT 1
+#include "ops_sse.h"
+
+#define SHIFT 2
 #include "ops_sse.h"

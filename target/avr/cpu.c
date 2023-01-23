@@ -57,14 +57,26 @@ static void avr_cpu_synchronize_from_tb(CPUState *cs,
     env->pc_w = tb_pc(tb) / 2; /* internally PC points to words */
 }
 
-static void avr_cpu_reset(DeviceState *ds)
+static void avr_restore_state_to_opc(CPUState *cs,
+                                     const TranslationBlock *tb,
+                                     const uint64_t *data)
 {
-    CPUState *cs = CPU(ds);
+    AVRCPU *cpu = AVR_CPU(cs);
+    CPUAVRState *env = &cpu->env;
+
+    env->pc_w = data[0];
+}
+
+static void avr_cpu_reset_hold(Object *obj)
+{
+    CPUState *cs = CPU(obj);
     AVRCPU *cpu = AVR_CPU(cs);
     AVRCPUClass *mcc = AVR_CPU_GET_CLASS(cpu);
     CPUAVRState *env = &cpu->env;
 
-    mcc->parent_reset(ds);
+    if (mcc->parent_phases.hold) {
+        mcc->parent_phases.hold(obj);
+    }
 
     env->pc_w = 0;
     env->sregI = 1;
@@ -202,6 +214,7 @@ static const struct SysemuCPUOps avr_sysemu_ops = {
 static const struct TCGCPUOps avr_tcg_ops = {
     .initialize = avr_cpu_tcg_init,
     .synchronize_from_tb = avr_cpu_synchronize_from_tb,
+    .restore_state_to_opc = avr_restore_state_to_opc,
     .cpu_exec_interrupt = avr_cpu_exec_interrupt,
     .tlb_fill = avr_cpu_tlb_fill,
     .do_interrupt = avr_cpu_do_interrupt,
@@ -212,9 +225,12 @@ static void avr_cpu_class_init(ObjectClass *oc, void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
     CPUClass *cc = CPU_CLASS(oc);
     AVRCPUClass *mcc = AVR_CPU_CLASS(oc);
+    ResettableClass *rc = RESETTABLE_CLASS(oc);
 
     device_class_set_parent_realize(dc, avr_cpu_realizefn, &mcc->parent_realize);
-    device_class_set_parent_reset(dc, avr_cpu_reset, &mcc->parent_reset);
+
+    resettable_class_set_parent_phases(rc, NULL, avr_cpu_reset_hold, NULL,
+                                       &mcc->parent_phases);
 
     cc->class_by_name = avr_cpu_class_by_name;
 

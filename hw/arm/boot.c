@@ -656,15 +656,17 @@ int arm_load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
     }
 
     if (binfo->initrd_size) {
-        rc = qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-start",
-                                   binfo->initrd_start);
+        rc = qemu_fdt_setprop_sized_cells(fdt, "/chosen", "linux,initrd-start",
+                                          acells, binfo->initrd_start);
         if (rc < 0) {
             fprintf(stderr, "couldn't set /chosen/linux,initrd-start\n");
             goto fail;
         }
 
-        rc = qemu_fdt_setprop_cell(fdt, "/chosen", "linux,initrd-end",
-                                   binfo->initrd_start + binfo->initrd_size);
+        rc = qemu_fdt_setprop_sized_cells(fdt, "/chosen", "linux,initrd-end",
+                                          acells,
+                                          binfo->initrd_start +
+                                          binfo->initrd_size);
         if (rc < 0) {
             fprintf(stderr, "couldn't set /chosen/linux,initrd-end\n");
             goto fail;
@@ -683,6 +685,8 @@ int arm_load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
      * the DTB is copied again upon reset, even if addr points into RAM.
      */
     rom_add_blob_fixed_as("dtb", fdt, size, addr, as);
+    qemu_register_reset_nosnapshotload(qemu_fdt_randomize_seeds,
+                                       rom_ptr_for_as(as, addr, size));
 
     g_free(fdt);
 
@@ -762,10 +766,15 @@ static void do_cpu_reset(void *opaque)
                     }
                     if (cpu_isar_feature(aa64_sve, cpu)) {
                         env->cp15.cptr_el[3] |= R_CPTR_EL3_EZ_MASK;
+                        env->vfp.zcr_el[3] = 0xf;
                     }
                     if (cpu_isar_feature(aa64_sme, cpu)) {
                         env->cp15.cptr_el[3] |= R_CPTR_EL3_ESM_MASK;
                         env->cp15.scr_el3 |= SCR_ENTP2;
+                        env->vfp.smcr_el[3] = 0xf;
+                    }
+                    if (cpu_isar_feature(aa64_hcx, cpu)) {
+                        env->cp15.scr_el3 |= SCR_HXEN;
                     }
                     /* AArch64 kernels never boot in secure mode */
                     assert(!info->secure_boot);
